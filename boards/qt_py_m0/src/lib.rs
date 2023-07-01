@@ -324,7 +324,7 @@ impl Spi {
             .sclk(self.sclk);
         spi::Config::new(pm, sercom2, pads, clock.freq())
             .spi_mode(spi::MODE_0)
-            .baud(baud)
+            .baud(baud.into())
             .enable()
     }
 }
