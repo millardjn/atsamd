@@ -118,6 +118,37 @@ impl State {
     }
 }
 
+pub enum DFLL48MRefClock {
+    /// Use the internal 32khz oscilator as a reference clock. It will also be available as GCLK1.
+    OSC32K,
+    /// Use the external 32khz oscilator as a reference clock. It will also be available as GCLK1.
+    XOSC32K,
+    /// Enable USB Clock Recovery which uses the 1khz USB Start-Of-Frame as a reference. If not connected to USB the DFLL48M is effectively in open loop mode with no reference.
+    USB,
+    /// Let the DFLL48M run in open loop mode. As there is no reference it varies further from 48mhz.
+    None,
+}
+
+impl DFLL48MRefClock {
+    fn divider(&self) -> Option<u16> {
+        match self {
+            DFLL48MRefClock::OSC32K => Some(((48_000_000u32 + 32768 / 2) / 32768) as u16),
+            DFLL48MRefClock::XOSC32K => Some(((48_000_000u32 + 32768 / 2) / 32768) as u16),
+            DFLL48MRefClock::USB => Some(((48_000_000u32) / 1000) as u16),
+            DFLL48MRefClock::None => None,
+        }
+    }
+
+    fn hertz_as_gclk1(&self) -> Hertz {
+        match self {
+            DFLL48MRefClock::OSC32K => OSC32K_FREQ,
+            DFLL48MRefClock::XOSC32K => OSC32K_FREQ,
+            DFLL48MRefClock::USB => 0.Hz(),
+            DFLL48MRefClock::None => 0.Hz(),
+        }
+    }
+}
+
 /// `GenericClockController` encapsulates the GCLK hardware.
 /// It provides a type safe way to configure the system clocks.
 /// Initializing the `GenericClockController` instance configures
@@ -131,6 +162,7 @@ pub struct GenericClockController {
 }
 
 impl GenericClockController {
+
     /// Reset the clock controller, configure the system to run
     /// at 48Mhz and reset various clock dividers.
     pub fn with_internal_32kosc(
@@ -139,7 +171,7 @@ impl GenericClockController {
         sysctrl: &mut SYSCTRL,
         nvmctrl: &mut NVMCTRL,
     ) -> Self {
-        Self::new_48mhz_from_32khz(gclk, pm, sysctrl, nvmctrl, false)
+        Self::new_48mhz(gclk, pm, sysctrl, nvmctrl, DFLL48MRefClock::OSC32K)
     }
 
     /// Reset the clock controller, configure the system to run
@@ -150,15 +182,15 @@ impl GenericClockController {
         sysctrl: &mut SYSCTRL,
         nvmctrl: &mut NVMCTRL,
     ) -> Self {
-        Self::new_48mhz_from_32khz(gclk, pm, sysctrl, nvmctrl, true)
+        Self::new_48mhz(gclk, pm, sysctrl, nvmctrl, DFLL48MRefClock::XOSC32K)
     }
 
-    fn new_48mhz_from_32khz(
+    pub fn new_48mhz(
         gclk: GCLK,
         pm: &mut PM,
         sysctrl: &mut SYSCTRL,
         nvmctrl: &mut NVMCTRL,
-        use_external_crystal: bool,
+        refclock: DFLL48MRefClock,
     ) -> Self {
         let mut state = State { gclk };
 
@@ -166,25 +198,29 @@ impl GenericClockController {
         #[cfg(feature = "samd21")]
         set_flash_manual_write(nvmctrl);
         enable_gclk_apb(pm);
-        if use_external_crystal {
-            enable_external_32kosc(sysctrl);
-        } else {
-            enable_internal_32kosc(sysctrl);
+        match refclock {
+            DFLL48MRefClock::OSC32K => enable_internal_32kosc(sysctrl),
+            DFLL48MRefClock::XOSC32K => enable_external_32kosc(sysctrl),
+            DFLL48MRefClock::USB | DFLL48MRefClock::None => {},
         }
 
         state.reset_gclk();
 
         // Enable a 32khz source -> GCLK1
-        if use_external_crystal {
-            state.set_gclk_divider_and_source(GCLK1, 1, XOSC32K, false);
-        } else {
-            state.set_gclk_divider_and_source(GCLK1, 1, OSC32K, false);
+        match refclock {
+            DFLL48MRefClock::OSC32K => state.set_gclk_divider_and_source(GCLK1, 1, XOSC32K, false),
+            DFLL48MRefClock::XOSC32K => state.set_gclk_divider_and_source(GCLK1, 1, OSC32K, false),
+            DFLL48MRefClock::USB | DFLL48MRefClock::None => {},
         }
 
         // Feed 32khz into the DFLL48
-        state.enable_clock_generator(DFLL48, GCLK1);
+        match refclock {
+            DFLL48MRefClock::OSC32K | DFLL48MRefClock::XOSC32K => state.enable_clock_generator(DFLL48, GCLK1),
+            DFLL48MRefClock::USB | DFLL48MRefClock::None => {},
+        }
+
         // Enable the DFLL48
-        configure_and_enable_dfll48m(sysctrl, use_external_crystal);
+        configure_and_enable_dfll48m(sysctrl, &refclock);
         // Feed DFLL48 into the main clock
         state.set_gclk_divider_and_source(GCLK0, 1, DFLL48M, true);
         // We are now running at 48Mhz
@@ -203,7 +239,7 @@ impl GenericClockController {
             state,
             gclks: [
                 OSC48M_FREQ,
-                OSC32K_FREQ,
+                refclock.hertz_as_gclk1(),
                 0.Hz(),
                 0.Hz(),
                 0.Hz(),
@@ -520,7 +556,7 @@ fn wait_for_dfllrdy(sysctrl: &mut SYSCTRL) {
 }
 
 /// Configure the dfll48m to operate at 48Mhz
-fn configure_and_enable_dfll48m(sysctrl: &mut SYSCTRL, use_external_crystal: bool) {
+fn configure_and_enable_dfll48m(sysctrl: &mut SYSCTRL, refclock: &DFLL48MRefClock) {
     // Turn it off while we configure it.
     // Note that we need to turn off on-demand mode and
     // disable it here, rather than just reseting the ctrl
@@ -528,61 +564,113 @@ fn configure_and_enable_dfll48m(sysctrl: &mut SYSCTRL, use_external_crystal: boo
     sysctrl.dfllctrl.write(|w| w.ondemand().clear_bit());
     wait_for_dfllrdy(sysctrl);
 
-    if use_external_crystal {
-        sysctrl.dfllmul.write(|w| unsafe {
-            w.cstep().bits(31);
-            w.fstep().bits(511);
-            // scaling factor between the clocks
-            w.mul().bits(((48_000_000u32 + 32768 / 2) / 32768) as u16)
-        });
+    match refclock {
+        DFLL48MRefClock::OSC32K => {
+            // Apply calibration
+            let coarse = super::calibration::dfll48m_coarse_cal();
+            let fine = 0x1ff;
+            sysctrl.dfllval.write(|w| unsafe {
+                w.coarse().bits(coarse);
+                w.fine().bits(fine)
+            });
 
-        // Turn it on
-        sysctrl.dfllctrl.write(|w| {
-            // always on
-            w.ondemand().clear_bit();
+            sysctrl.dfllmul.write(|w| unsafe {
+                w.cstep().bits(coarse / 4);
+                w.fstep().bits(10);
+                // scaling factor between the clocks
+                w.mul().bits((48_000_000u32 / 32768) as u16)
+            });
 
-            // closed loop mode
-            w.mode().set_bit();
+            // Turn it on
+            sysctrl.dfllctrl.write(|w| {
+                // always on
+                w.ondemand().clear_bit();
 
-            w.waitlock().set_bit();
+                // closed loop mode
+                w.mode().set_bit();
 
-            // Disable quick lock
-            w.qldis().set_bit()
-        });
-    } else {
-        // Apply calibration
-        let coarse = super::calibration::dfll48m_coarse_cal();
-        let fine = 0x1ff;
+                // chill cycle disable
+                w.ccdis().set_bit();
 
-        sysctrl.dfllval.write(|w| unsafe {
-            w.coarse().bits(coarse);
-            w.fine().bits(fine)
-        });
+                // bypass coarse lock (have calibration data)
+                w.bplckc().set_bit()
+            });
+        },
+        DFLL48MRefClock::XOSC32K => {
+            sysctrl.dfllmul.write(|w| unsafe {
+                w.cstep().bits(31);
+                w.fstep().bits(511);
+                // scaling factor between the clocks
+                w.mul().bits(((48_000_000u32 + 32768 / 2) / 32768) as u16)
+            });
+    
+            // Turn it on
+            sysctrl.dfllctrl.write(|w| {
+                // always on
+                w.ondemand().clear_bit();
+    
+                // closed loop mode
+                w.mode().set_bit();
+    
+                w.waitlock().set_bit();
+    
+                // Disable quick lock
+                w.qldis().set_bit()
+            });
+        },
+        DFLL48MRefClock::USB => {
+            // Apply calibration
+            let coarse = super::calibration::dfll48m_coarse_cal();
+            let fine = 0x1ff;
+            sysctrl.dfllval.write(|w| unsafe {
+                w.coarse().bits(coarse);
+                w.fine().bits(fine)
+            });
 
-        sysctrl.dfllmul.write(|w| unsafe {
-            w.cstep().bits(coarse / 4);
-            w.fstep().bits(10);
-            // scaling factor for 1 kHz USB SOF signal
-            w.mul().bits((48_000_000u32 / 1000) as u16)
-        });
+            sysctrl.dfllmul.write(|w| unsafe {
+                w.cstep().bits(1);
+                w.fstep().bits(1);
+                // scaling factor between the clocks
+                w.mul().bits((48_000_000u32 / 1000) as u16)
+            });
 
-        // Turn it on
-        sysctrl.dfllctrl.write(|w| {
-            // always on
-            w.ondemand().clear_bit();
+            // Turn it on
+            sysctrl.dfllctrl.write(|w| {
+                // always on
+                w.ondemand().clear_bit();
 
-            // closed loop mode
-            w.mode().set_bit();
+                // closed loop mode
+                w.mode().set_bit();
 
-            // chill cycle disable
-            w.ccdis().set_bit();
+                // chill cycle disable
+                w.ccdis().set_bit();
 
-            // usb correction
-            w.usbcrm().set_bit();
+                // enable usb clock recovery
+                w.usbcrm().set_bit();
 
-            // bypass coarse lock (have calibration data)
-            w.bplckc().set_bit()
-        });
+                // bypass coarse lock (have calibration data)
+                w.bplckc().set_bit()
+            });
+        },
+        DFLL48MRefClock::None => {
+            // Apply calibration
+            let coarse = super::calibration::dfll48m_coarse_cal();
+            let fine = 0x1ff;
+            sysctrl.dfllval.write(|w| unsafe {
+                w.coarse().bits(coarse);
+                w.fine().bits(fine)
+            });
+
+            // Turn it on
+            sysctrl.dfllctrl.write(|w| {
+                // always on
+                w.ondemand().clear_bit();
+
+                // open loop mode
+                w.mode().clear_bit()
+            });
+
+        }
     }
 
     wait_for_dfllrdy(sysctrl);
@@ -591,12 +679,67 @@ fn configure_and_enable_dfll48m(sysctrl: &mut SYSCTRL, use_external_crystal: boo
     sysctrl.dfllctrl.modify(|_, w| w.enable().set_bit());
 
     #[cfg(feature = "samd21")]
-    if use_external_crystal {
+    if let DFLL48MRefClock::XOSC32K = refclock  {
         // wait for lock
         while sysctrl.pclksr.read().dflllckc().bit_is_clear()
             || sysctrl.pclksr.read().dflllckf().bit_is_clear()
         {}
     }
+
+    wait_for_dfllrdy(sysctrl);
+}
+
+/// Configure the dfll48m to operate at 48Mhz
+fn configure_and_enable_dfll48m_open(sysctrl: &mut SYSCTRL) {
+    // Turn it off while we configure it.
+    // Note that we need to turn off on-demand mode and
+    // disable it here, rather than just reseting the ctrl
+    // register, otherwise our configuration attempt fails.
+    sysctrl.dfllctrl.write(|w| w.ondemand().clear_bit());
+    wait_for_dfllrdy(sysctrl);
+
+
+    // Apply calibration
+    let coarse = super::calibration::dfll48m_coarse_cal();
+    let fine = 0x1ff;
+
+    sysctrl.dfllval.write(|w| unsafe {
+        w.coarse().bits(coarse);
+        w.fine().bits(fine)
+    });
+
+    sysctrl.dfllmul.write(|w| unsafe {
+        w.cstep().bits(coarse / 4);
+        w.fstep().bits(10);
+        // scaling factor for 1 kHz USB SOF signal
+        w.mul().bits((48_000_000u32 / 1000) as u16)
+    });
+
+    // Turn it on
+    sysctrl.dfllctrl.write(|w| {
+        // always on
+        w.ondemand().clear_bit();
+
+        // closed loop mode
+        w.mode().set_bit();
+
+        // chill cycle disable
+        w.ccdis().set_bit();
+
+        // usb correction
+        w.usbcrm().set_bit();
+
+        // bypass coarse lock (have calibration data)
+        w.bplckc().set_bit()
+    });
+    
+
+    wait_for_dfllrdy(sysctrl);
+
+    // and finally enable it!
+    sysctrl.dfllctrl.modify(|_, w| w.enable().set_bit());
+
+    #[cfg(feature = "samd21")]
 
     wait_for_dfllrdy(sysctrl);
 }
