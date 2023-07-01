@@ -20,14 +20,16 @@
 //! [schematics]: https://cdn-learn.adafruit.com/assets/assets/000/095/390/original/adafruit_products_QTPy_sch.png
 
 pub use atsamd_hal as hal;
+use hal::gpio::{PA16, PA17, Alternate, Pin, C};
 pub use hal::pac;
 
 use hal::bsp_pins;
 use hal::clock::GenericClockController;
-use hal::sercom::v2::spi;
-use hal::sercom::v2::uart::{self, BaudMode, Oversampling};
-use hal::sercom::v2::{Sercom0, Sercom2};
-use hal::sercom::I2CMaster1;
+use hal::pac::SERCOM1;
+use hal::sercom::{spi, Sercom1};
+use hal::sercom::uart::{self, BaudMode, Oversampling};
+use hal::sercom::{Sercom0, Sercom2};
+use hal::sercom::i2c::{self, Pads, Config};
 use hal::time::Hertz;
 
 #[cfg(feature = "rt")]
@@ -37,6 +39,8 @@ pub use cortex_m_rt::entry;
 use hal::usb::UsbBus;
 #[cfg(feature = "usb")]
 use usb_device::bus::UsbBusAllocator;
+
+type I2c = hal::sercom::i2c::I2c<Config<Pads<SERCOM1, Pin<PA16, Alternate<C>>, Pin<PA17, Alternate<C>>>>>;
 
 bsp_pins! {
     // General purpose pins.
@@ -201,7 +205,7 @@ impl Pins {
             mosi: self.mosi,
             sclk: self.sclk,
         };
-        let i2c = I2c {
+        let i2c = I2cPins {
             sda: self.sda,
             scl: self.scl,
         };
@@ -233,7 +237,7 @@ pub struct Sets {
     /// SPI pins.
     pub spi: Spi,
     /// I2C/QWIIC pins.
-    pub i2c: I2c,
+    pub i2c: I2cPins,
     /// On-board Neopixel pins.
     pub neopixel: Neopixel,
     /// USB pins.
@@ -326,32 +330,29 @@ impl Spi {
 }
 
 /// I2C pins.
-pub struct I2c {
+pub struct I2cPins {
     /// I2C SDA pin.
     pub sda: I2cSdaReset,
     /// I2C SCL pin.
     pub scl: I2cSclReset,
 }
 
-impl I2c {
+impl I2cPins {
     /// Convenience function for creating an I2C host on the I2C pins.
+    /// 
+    /// The maximum baud rate is GCLK0 frequency/10
     pub fn init(
         self,
         clocks: &mut GenericClockController,
-        freq: impl Into<Hertz>,
+        baud: impl Into<Hertz>,
         sercom1: pac::SERCOM1,
         pm: &mut pac::PM,
-    ) -> I2CMaster1<I2cSda, I2cScl> {
-        let gclk0 = clocks.gclk0();
-        let clock = &clocks.sercom1_core(&gclk0).unwrap();
-        I2CMaster1::new(
-            clock,
-            freq.into(),
-            sercom1,
-            pm,
-            self.sda.into(),
-            self.scl.into(),
-        )
+    ) -> I2c {
+        let f: Hertz = clocks.gclk0().into();
+        let pads = i2c::Pads::<Sercom1, I2cSda, I2cScl>::new(self.sda, self.scl);
+        let config = i2c::Config::new(pm, sercom1, pads, f);
+
+        config.baud(baud).enable()
     }
 }
 
